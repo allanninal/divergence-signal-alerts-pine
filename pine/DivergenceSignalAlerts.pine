@@ -1,0 +1,314 @@
+// This source code is subject to the terms of the PolyForm Noncommercial License 1.0.0
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+// © allanninal
+
+//@version=6
+
+//@description Divergence Signal Alerts: RSI and MACD-histogram divergence, regular and hidden, on closed bars only.
+// A pivot low needs `left` higher lows before it and `right` bars after it that are not lower, so it is known `right`
+// bars later: the arrow sits on that confirming bar and the line joins the two price pivots. Pivot highs mirror it.
+// Nothing is drawn into the past or removed. The exact rules are tests/reference.py.
+indicator("Divergence Signal Alerts", shorttitle = "Divergence Alerts", overlay = true, max_lines_count = 500)
+
+// ───────────────────────────── Constants ─────────────────────────────
+const int RING     = 160      // recent bars kept (left + right + max distance must stay below it)
+const int NOSC     = 2        // oscillators: 0 RSI, 1 MACD histogram (the bit numbering of the MetaTrader editions)
+const int OSC_RSI  = 0
+const int OSC_MACD = 1
+const int NPIV     = 4        // previous pivots remembered per side
+
+const string GROUP_OSC     = "Oscillators"
+const string GROUP_DIV     = "Divergence"
+const string GROUP_DISPLAY = "Display"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+bool useRsi  = input.bool(true, "RSI divergence", group = GROUP_OSC, inline = "rsi", tooltip = "RSI (Wilder) of the close.")
+int  rsiLen  = input.int(14, "RSI period", minval = 2, maxval = 100, group = GROUP_OSC, inline = "rsi")
+bool useMacd = input.bool(true, "MACD histogram divergence", group = GROUP_OSC, tooltip = "MACD line (fast EMA - slow EMA) minus its signal EMA.")
+int  fastLen = input.int(12, "MACD fast EMA", minval = 1, maxval = 100, group = GROUP_OSC, inline = "macd")
+int  slowLen = input.int(26, "MACD slow EMA", minval = 2, maxval = 200, group = GROUP_OSC, inline = "macd")
+int  sigLen  = input.int(9, "MACD signal EMA", minval = 1, maxval = 100, group = GROUP_OSC, inline = "macd")
+
+bool regular = input.bool(true, "Regular divergence (reversal)", group = GROUP_DIV, tooltip = "Bullish: a lower low on price with a higher low on the oscillator. Bearish: a higher high on price with a lower high on the oscillator.")
+bool hidden  = input.bool(false, "Hidden divergence (continuation)", group = GROUP_DIV, tooltip = "Bullish: a higher low on price with a lower low on the oscillator. Bearish: a lower high on price with a higher high on the oscillator.")
+int  left    = input.int(5, "Pivot: bars on the left", minval = 1, maxval = 30, group = GROUP_DIV, tooltip = "A pivot low must be lower than this many bars before it (a pivot high higher).")
+int  right   = input.int(3, "Pivot: bars on the right", minval = 1, maxval = 30, group = GROUP_DIV, tooltip = "Bars after the pivot that must not go beyond it. This is also the delay: the divergence is marked this many bars after the pivot, on the bar that confirms it.")
+int  minDist = input.int(5, "Pivots at least this many bars apart", minval = 1, maxval = 120, group = GROUP_DIV)
+int  maxDist = input.int(60, "Pivots at most this many bars apart", minval = 2, maxval = 120, group = GROUP_DIV, tooltip = "Left + right + this must stay below 160.")
+bool clean   = input.bool(true, "Clean lines", group = GROUP_DIV, tooltip = "No bar between the two pivots may cross the straight line that joins them, on price or on the oscillator.")
+bool both    = input.bool(false, "Only when RSI and MACD both diverge", group = GROUP_DIV, tooltip = "With both oscillators on, mark a divergence only when both agree on the same two pivots.")
+
+bool  showLines = input.bool(true, "Line between the price pivots", group = GROUP_DISPLAY, tooltip = "Solid for regular, dashed for hidden. Hover the arrow's bar in the Data Window for the details. TradingView keeps the latest 500 lines.")
+color bullColor = input.color(#089981, "Bullish", group = GROUP_DISPLAY, inline = "colors")
+color bearColor = input.color(#F23645, "Bearish", group = GROUP_DISPLAY, inline = "colors")
+
+if not useRsi and not useMacd
+    runtime.error("Switch on RSI, MACD or both.")
+if not regular and not hidden
+    runtime.error("Switch on regular, hidden or both.")
+if slowLen <= fastLen or maxDist < minDist or left + right + maxDist >= RING
+    runtime.error("The MACD slow EMA must be longer than the fast one, the maximum distance at least the minimum, and left + right + maximum distance below 160.")
+
+// ───────────────────────────── Functions ─────────────────────────────
+//@function Bit value of an oscillator index, used to build the masks.
+//@param i Oscillator index.
+//@returns 2 to the power i.
+bit(int i) => int(math.pow(2, i))
+
+//@function Whether bit i is set in a mask.
+//@param mask Bit mask.
+//@param i Bit index.
+//@returns true when set.
+hasBit(int mask, int i) => int(mask / bit(i)) % 2 == 1
+
+//@function Names of the oscillators in a mask, joined with "+".
+//@param mask Oscillator bit mask.
+//@returns For example "RSI+MACD".
+maskNames(int mask) =>
+    string out = ""
+    if hasBit(mask, OSC_RSI)
+        out := "RSI"
+    if hasBit(mask, OSC_MACD)
+        out := out == "" ? "MACD" : out + "+MACD"
+    out
+
+//@function One step of an EMA seeded with the simple average of its first n values.
+//@param cnt Values fed so far.
+//@param sum Their sum while seeding.
+//@param v The EMA so far (na while seeding).
+//@param n Length.
+//@param x New value.
+//@returns [count, sum, EMA] after x; the EMA is na until n values were fed.
+emaStep(int cnt, float sum, float v, int n, float x) =>
+    int   c = cnt + 1
+    float s = sum
+    float e = na
+    if c < n
+        s += x
+    else if c == n
+        s += x
+        e := s / n
+    else
+        e := v + 2.0 / (n + 1) * (x - v)
+    [c, s, e]
+
+//@function Whether bar p (absolute bar index) is a pivot low (dir 1) or high (dir -1), judged when p + right has closed.
+//@param buf Ring of lows (dir 1) or highs (dir -1).
+//@param p Bar index of the candidate.
+//@param dir 1 low, -1 high.
+//@returns true for a pivot.
+isPivot(array<float> buf, int p, int dir) =>
+    bool ok = p - left >= 0
+    if ok
+        float v = array.get(buf, p % RING)
+        for j = 1 to left
+            if not (dir * (array.get(buf, (p - j) % RING) - v) > 0)
+                ok := false
+                break
+        if ok
+            for j = 1 to right
+                if dir * (v - array.get(buf, (p + j) % RING)) > 0
+                    ok := false
+                    break
+    ok
+
+//@function Whether no bar strictly between q and p crosses the straight line q-p: below it for lows, above it for highs.
+//@param buf Ring (prices, or all oscillators one after the other).
+//@param base Offset of the series inside buf (oscillator index x RING; 0 for prices).
+//@param q Older pivot (bar index).
+//@param p Newer pivot (bar index).
+//@param dir 1 lows, -1 highs.
+//@returns true when clean.
+isClean(array<float> buf, int base, int q, int p, int dir) =>
+    float a = array.get(buf, base + q % RING)
+    float b = array.get(buf, base + p % RING)
+    bool ok = true
+    int j = q + 1
+    while ok and j < p
+        float lineVal = a + (b - a) * (j - q) / (p - q)
+        float v = array.get(buf, base + j % RING)
+        if na(v) or (dir > 0 ? v < lineVal : v > lineVal)
+            ok := false
+        j += 1
+    ok
+
+//@function The divergence at the new pivot p against the remembered pivots of the same side, nearest first.
+//@param piv Previous pivots of this side (bar indexes, newest first).
+//@param price Ring of lows (dir 1) or highs (dir -1).
+//@param osc Ring of the oscillators.
+//@param useMask Bits of the oscillators that are switched on.
+//@param minCount Oscillators that must diverge.
+//@param p The new pivot.
+//@param dir 1 bullish (lows), -1 bearish (highs).
+//@returns [type (0 none, 1 regular, 2 hidden), oscillator mask, older pivot] of the first pivot that qualifies.
+checkSide(array<int> piv, array<float> price, array<float> osc, int useMask, int minCount, int p, int dir) =>
+    int resType = 0
+    int resMask = 0
+    int resQ    = -1
+    for q in piv
+        int d = p - q
+        if d > maxDist
+            break                                   // newest first: the rest are older still
+        if d < minDist
+            continue
+        float pp = array.get(price, p % RING)
+        float pq = array.get(price, q % RING)
+        int typ = dir * (pq - pp) > 0 ? 1 : dir * (pp - pq) > 0 ? 2 : 0
+        if typ == 0 or (typ == 1 and not regular) or (typ == 2 and not hidden)
+            continue
+        if clean and not isClean(price, 0, q, p, dir)
+            continue
+        int mask = 0
+        int cnt  = 0
+        for o = 0 to NOSC - 1
+            if hasBit(useMask, o)
+                float op = array.get(osc, o * RING + p % RING)
+                float oq = array.get(osc, o * RING + q % RING)
+                if not na(op) and not na(oq)
+                    // regular bullish: higher oscillator low; hidden bullish: lower one; bearish flips the sign
+                    bool div = typ == 1 ? dir * (op - oq) > 0 : dir * (op - oq) < 0
+                    if div and (not clean or isClean(osc, o * RING, q, p, dir))
+                        mask += bit(o)
+                        cnt += 1
+        if cnt >= math.max(1, minCount)
+            resType := typ
+            resMask := mask
+            resQ    := q
+            break
+    [resType, resMask, resQ]
+
+//@function Puts a new pivot in front of the list and keeps the newest NPIV.
+//@param piv The list.
+//@param p The pivot (bar index).
+//@returns Nothing.
+remember(array<int> piv, int p) =>
+    array.unshift(piv, p)
+    if array.size(piv) > NPIV
+        array.pop(piv)
+
+// ───────────────────────────── Calculations ─────────────────────────────
+// Rings of the recent bars, indexed by bar_index % RING.
+var array<float> hiBuf  = array.new<float>(RING, na)
+var array<float> loBuf  = array.new<float>(RING, na)
+var array<float> oscBuf = array.new<float>(NOSC * RING, na)
+var array<int>   pivLo  = array.new<int>()
+var array<int>   pivHi  = array.new<int>()
+
+int k = bar_index
+int r = k % RING
+array.set(hiBuf, r, high)
+array.set(loBuf, r, low)
+
+// RSI, Wilder: the first average is the simple mean of the first rsiLen changes.
+var float rsiSumUp = 0.0
+var float rsiSumDn = 0.0
+var float rsiUp    = 0.0
+var float rsiDn    = 0.0
+float rsiVal = na
+if k >= 1
+    float ch = close - close[1]
+    float up = math.max(ch, 0.0)
+    float dn = math.max(-ch, 0.0)
+    if k < rsiLen
+        rsiSumUp += up
+        rsiSumDn += dn
+    else if k == rsiLen
+        rsiSumUp += up
+        rsiSumDn += dn
+        rsiUp := rsiSumUp / rsiLen
+        rsiDn := rsiSumDn / rsiLen
+    else
+        rsiUp := (rsiUp * (rsiLen - 1) + up) / rsiLen
+        rsiDn := (rsiDn * (rsiLen - 1) + dn) / rsiLen
+    if k >= rsiLen
+        rsiVal := rsiDn == 0.0 ? 100.0 : rsiUp == 0.0 ? 0.0 : 100.0 - 100.0 / (1.0 + rsiUp / rsiDn)
+
+// MACD histogram; each EMA is seeded with the simple average of its first values (as the MetaTrader editions).
+var int   fCnt = 0
+var float fSum = 0.0
+var float fEma = na
+var int   sCnt = 0
+var float sSum = 0.0
+var float sEma = na
+var int   gCnt = 0
+var float gSum = 0.0
+var float gEma = na
+[fc, fs, fe] = emaStep(fCnt, fSum, fEma, fastLen, close)
+[sc, ss, se] = emaStep(sCnt, sSum, sEma, slowLen, close)
+fCnt := fc
+fSum := fs
+fEma := fe
+sCnt := sc
+sSum := ss
+sEma := se
+float macdVal = na
+if not na(fEma) and not na(sEma)
+    float macdLine = fEma - sEma
+    [gc, gs, ge] = emaStep(gCnt, gSum, gEma, sigLen, macdLine)
+    gCnt := gc
+    gSum := gs
+    gEma := ge
+    if not na(gEma)
+        macdVal := macdLine - gEma
+
+array.set(oscBuf, OSC_RSI * RING + r, rsiVal)
+array.set(oscBuf, OSC_MACD * RING + r, macdVal)
+
+int useMask  = (useRsi ? bit(OSC_RSI) : 0) + (useMacd ? bit(OSC_MACD) : 0)
+int minCount = both and useRsi and useMacd ? 2 : 1
+
+// The candidate pivot is the bar `right` bars back; it is decided now, on the bar that confirms it.
+int   evDir  = 0
+int   evType = 0
+int   evMask = 0
+int   evQ    = -1
+int   p      = k - right
+if p >= 0
+    if isPivot(loBuf, p, 1)
+        [t, m, q] = checkSide(pivLo, loBuf, oscBuf, useMask, minCount, p, 1)
+        if t > 0
+            evDir := 1
+            evType := t
+            evMask := m
+            evQ := q
+        remember(pivLo, p)
+    bool pivotHigh = isPivot(hiBuf, p, -1)
+    if evDir == 0 and pivotHigh
+        [t, m, q] = checkSide(pivHi, hiBuf, oscBuf, useMask, minCount, p, -1)
+        if t > 0
+            evDir := -1
+            evType := t
+            evMask := m
+            evQ := q
+    if pivotHigh                                   // a bar can be both; the high is kept for later pivots
+        remember(pivHi, p)
+
+// Only a closed bar counts: on the live bar nothing is drawn or alerted until it closes.
+bool closed  = barstate.isconfirmed
+bool bullNow = closed and evDir > 0
+bool bearNow = closed and evDir < 0
+
+// ───────────────────────────── Plots ─────────────────────────────
+plotshape(bullNow, "Bullish divergence", shape.triangleup, location.belowbar, bullColor, size = size.tiny)
+plotshape(bearNow, "Bearish divergence", shape.triangledown, location.abovebar, bearColor, size = size.tiny)
+// Details for the Data Window and other scripts (the tests read them).
+plot(closed ? evDir : na, "Divergence (+1 bullish, -1 bearish)", display = display.data_window)
+plot(closed and evDir != 0 ? evType : na, "Type (1 regular, 2 hidden)", display = display.data_window)
+plot(closed and evDir != 0 ? evMask : na, "Oscillators (bit mask: 1 RSI, 2 MACD)", display = display.data_window)
+plot(closed and evDir != 0 ? k - evQ : na, "Older pivot (bars back)", display = display.data_window)
+plot(rsiVal, "RSI", display = display.data_window)
+plot(macdVal, "MACD histogram", display = display.data_window)
+
+if showLines and closed and evDir != 0
+    float pPx = evDir > 0 ? low[right] : high[right]
+    float qPx = array.get(evDir > 0 ? loBuf : hiBuf, evQ % RING)
+    line.new(evQ, qPx, p, pPx, xloc.bar_index, extend.none, evDir > 0 ? bullColor : bearColor, evType == 1 ? line.style_solid : line.style_dashed, evType == 1 ? 2 : 1)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+// One alert per closed bar that confirmed a divergence. Create it with "Any alert() function call".
+if closed and evDir != 0
+    string msg = (evType == 1 ? "Regular " : "Hidden ") + (evDir > 0 ? "bullish" : "bearish") + " divergence (" + maskNames(evMask) + ") on " + syminfo.ticker + " " + timeframe.period
+    alert(msg, alert.freq_once_per_bar_close)
+
+alertcondition(bullNow, "Bullish divergence", "Bullish divergence on {{ticker}} {{interval}}")
+alertcondition(bearNow, "Bearish divergence", "Bearish divergence on {{ticker}} {{interval}}")

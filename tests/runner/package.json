@@ -1,0 +1,7 @@
+{
+  "name": "divergence-signal-alerts-pine-tests",
+  "private": true,
+  "type": "module",
+  "description": "Local Pine v6 test runner (PineTS, AGPL-3.0, used for testing only, not redistributed).",
+  "dependencies": { "pinets": "0.12.0" }
+}
