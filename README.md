@@ -164,7 +164,7 @@ calls it clean. The test reruns the reference with PineTS's comparison rule and 
 rerun gives the script's result; any other difference fails.
 
 Data: the latest 5,000 closed bars of EURUSD, GBPJPY, XAUUSD and BTCUSD on M15, H1 and H4 (12 series, broker history).
-The script runs locally in [PineTS](https://github.com/LuxAlgo/PineTS), an open-source Pine v6 runtime. To repeat it on
+The script runs locally in [PineTS](https://github.com/LuxAlgo/PineTS), an independent Pine v6 runtime (not TradingView's engine). To repeat it on
 your own bars:
 
 ```bash
